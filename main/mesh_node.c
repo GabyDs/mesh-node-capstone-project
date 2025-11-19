@@ -248,6 +248,20 @@ static void capture_photo_task(void *arg)
             continue;
         }
 
+        for (int i = 0; i < 3; i++)
+        {
+            // Warm up camera
+            camera_fb_t *frame_buffer = esp_camera_fb_get();
+            if (!frame_buffer)
+            {
+                ESP_LOGE(TAG, "Failed to warm up camera on attempt %d", i + 1);
+                continue;
+            }
+            esp_camera_fb_return(frame_buffer);
+        }
+        
+        vTaskDelay(5 / portTICK_PERIOD_MS); // Short delay after warm-up
+
         /* Capture and save photo */
         ESP_LOGI(TAG, "Capturing photo #%d...", g_photo_counter + 1);
         esp_err_t ret = capture_and_save_photo(++g_photo_counter);
@@ -260,8 +274,8 @@ static void capture_photo_task(void *arg)
             ESP_LOGE(TAG, "Failed to capture/save photo #%d: %s", g_photo_counter, esp_err_to_name(ret));
         }
 
-        /* Wait 10 seconds before next capture */
-        vTaskDelay(10000 / portTICK_PERIOD_MS);
+        /* Wait 20 seconds before next capture */
+        vTaskDelay(20000 / portTICK_PERIOD_MS);
     }
 
     /* This should never be reached, but good practice */
