@@ -42,6 +42,12 @@ static const char *TAG = "mesh_node";
 static mesh_addr_t s_known_root_addr = {0};
 static bool s_root_addr_valid = false;
 
+// Function prototypes
+static esp_err_t capture_and_save_photo(int photo_counter);
+
+// Global counter for photo naming
+static int g_photo_counter = 0;
+
 static void remember_root_addr(const mesh_addr_t *addr)
 {
     if (!addr)
@@ -120,10 +126,54 @@ static esp_err_t s_example_write_file(const char *path, uint8_t *data, size_t si
 }
 
 /**
+ * @brief Task to capture and save photos periodically when mesh is ready
+ */
+static void capture_photo_task(void *arg)
+{
+    ESP_LOGI(TAG, "Capture photo task started");
+
+    /* Wait for mesh connection before attempting capture */
+    while (!mwifi_is_connected())
+    {
+        ESP_LOGW(TAG, "Waiting for mesh connection...");
+        vTaskDelay(1000 / portTICK_PERIOD_MS);
+    }
+
+    for (int i = 0; i < 3; i++)
+    {
+        // Warm up camera
+        camera_fb_t *frame_buffer = esp_camera_fb_get();
+        if (!frame_buffer)
+        {
+            ESP_LOGE(TAG, "Failed to warm up camera on attempt %d", i + 1);
+            continue;
+        }
+        esp_camera_fb_return(frame_buffer);
+    }
+    
+    vTaskDelay(5 / portTICK_PERIOD_MS); // Short delay after warm-up
+
+    /* Capture and save photo */
+    ESP_LOGI(TAG, "Capturing photo #%d...", g_photo_counter + 1);
+    esp_err_t ret = capture_and_save_photo(++g_photo_counter);
+    if (ret == ESP_OK)
+    {
+        ESP_LOGI(TAG, "Photo #%d captured and saved successfully!", g_photo_counter);
+    }
+    else
+    {
+        ESP_LOGE(TAG, "Failed to capture/save photo #%d: %s", g_photo_counter, esp_err_to_name(ret));
+    }
+
+    vTaskDelete(NULL);
+}
+
+/**
  * @brief Task to handle motion detection notifications
  */
 static void motion_detection_task(void *arg)
 {
+    esp_err_t ret = ESP_FAIL;
     ESP_LOGI(TAG, "Motion detection task started");
 
     for (;;)
@@ -133,6 +183,13 @@ static void motion_detection_task(void *arg)
 
         // Print motion detected message
         ESP_LOGI(TAG, "*** MOVEMENT DETECTED! *** PIR sensor triggered");
+
+        ret = xTaskCreate(capture_photo_task, "capture_photo_task", 4 * 1024, NULL, CONFIG_MDF_TASK_DEFAULT_PRIOTY, NULL);
+        if (ret != ESP_OK)
+        {
+            ESP_LOGE(TAG, "Failed to create capture photo task");
+            return;
+        }
 
         // Optional: Add debouncing delay to prevent spam
         vTaskDelay(500 / portTICK_PERIOD_MS);
@@ -224,63 +281,6 @@ static esp_err_t s_example_reset_card_power(void)
 #define BUF_SIZE (1024)
 
 static esp_netif_t *netif_sta = NULL;
-
-// Function prototypes
-static esp_err_t capture_and_save_photo(int photo_counter);
-
-// Global counter for photo naming
-static int g_photo_counter = 0;
-
-/**
- * @brief Task to capture and save photos periodically when mesh is ready
- */
-static void capture_photo_task(void *arg)
-{
-    ESP_LOGI(TAG, "Capture photo task started - mesh is ready!");
-
-    for (;;)
-    {
-        /* Wait for mesh connection before attempting capture */
-        if (!mwifi_is_connected())
-        {
-            ESP_LOGW(TAG, "Waiting for mesh connection...");
-            vTaskDelay(1000 / portTICK_PERIOD_MS);
-            continue;
-        }
-
-        for (int i = 0; i < 3; i++)
-        {
-            // Warm up camera
-            camera_fb_t *frame_buffer = esp_camera_fb_get();
-            if (!frame_buffer)
-            {
-                ESP_LOGE(TAG, "Failed to warm up camera on attempt %d", i + 1);
-                continue;
-            }
-            esp_camera_fb_return(frame_buffer);
-        }
-        
-        vTaskDelay(5 / portTICK_PERIOD_MS); // Short delay after warm-up
-
-        /* Capture and save photo */
-        ESP_LOGI(TAG, "Capturing photo #%d...", g_photo_counter + 1);
-        esp_err_t ret = capture_and_save_photo(++g_photo_counter);
-        if (ret == ESP_OK)
-        {
-            ESP_LOGI(TAG, "Photo #%d captured and saved successfully!", g_photo_counter);
-        }
-        else
-        {
-            ESP_LOGE(TAG, "Failed to capture/save photo #%d: %s", g_photo_counter, esp_err_to_name(ret));
-        }
-
-        /* Wait 20 seconds before next capture */
-        vTaskDelay(20000 / portTICK_PERIOD_MS);
-    }
-
-    /* This should never be reached, but good practice */
-    vTaskDelete(NULL);
-}
 
 static mdf_err_t sd_init()
 {
@@ -701,8 +701,8 @@ void app_main()
     xTimerStart(timer, 0);
 
 
-    MDF_LOGI("Creating capture photo task...");
-    xTaskCreate(capture_photo_task, "capture_photo_task", 4 * 1024, NULL, CONFIG_MDF_TASK_DEFAULT_PRIOTY, NULL);
+    // MDF_LOGI("Creating capture photo task...");
+    // xTaskCreate(capture_photo_task, "capture_photo_task", 4 * 1024, NULL, CONFIG_MDF_TASK_DEFAULT_PRIOTY, NULL);
 
     // Create motion detection task
     ESP_LOGI(TAG, "Creating motion detection task...");
