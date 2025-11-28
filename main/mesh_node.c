@@ -173,7 +173,6 @@ static void capture_photo_task(void *arg)
  */
 static void motion_detection_task(void *arg)
 {
-    esp_err_t ret = ESP_FAIL;
     ESP_LOGI(TAG, "Motion detection task started");
 
     for (;;)
@@ -184,12 +183,7 @@ static void motion_detection_task(void *arg)
         // Print motion detected message
         ESP_LOGI(TAG, "*** MOVEMENT DETECTED! *** PIR sensor triggered");
 
-        ret = xTaskCreate(capture_photo_task, "capture_photo_task", 4 * 1024, NULL, CONFIG_MDF_TASK_DEFAULT_PRIOTY, NULL);
-        if (ret != ESP_OK)
-        {
-            ESP_LOGE(TAG, "Failed to create capture photo task");
-            return;
-        }
+        xTaskCreate(capture_photo_task, "capture_photo_task", 4 * 1024, NULL, CONFIG_MDF_TASK_DEFAULT_PRIOTY, NULL);
 
         // Optional: Add debouncing delay to prevent spam
         vTaskDelay(500 / portTICK_PERIOD_MS);
