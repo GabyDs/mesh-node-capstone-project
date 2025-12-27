@@ -12,30 +12,32 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "mdf_common.h"
-#include "mwifi.h"
-#include "driver/uart.h"
 #include "app_config.h"
 #include "camera_driver.h"
+#include "driver/uart.h"
+#include "mdf_common.h"
+#include "mwifi.h"
 
-#include <string.h>
-#include <stdbool.h>
-#include <sys/unistd.h>
-#include <sys/stat.h>
-#include <errno.h>
-#include "esp_vfs_fat.h"
-#include "sdmmc_cmd.h"
-#include "driver/sdmmc_host.h"
 #include "driver/gpio.h"
-#include "sd_test_io.h"
-#include "esp_wifi.h"
-#include "esp_netif.h"
+#include "driver/sdmmc_host.h"
+#include "esp_heap_caps.h"
 #include "esp_mesh.h"
+#include "esp_netif.h"
+#include "esp_vfs_fat.h"
+#include "esp_wifi.h"
+#include "sd_test_io.h"
+#include "sdmmc_cmd.h"
+#include <errno.h>
+#include <stdbool.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/unistd.h>
 #if SOC_SDMMC_IO_POWER_EXTERNAL
 #include "sd_pwr_ctrl_by_on_chip_ldo.h"
 #endif
 
 #define PIR_SENSOR_PIN 12 // GPIO 12
+#define IMAGE_QUEUE_MAX 5 // Max pending images in queue
 
 static const char *TAG = "mesh_node";
 
@@ -48,150 +50,268 @@ static esp_err_t capture_and_save_photo(int photo_counter);
 // Global counter for photo naming
 static int g_photo_counter = 0;
 
-static void remember_root_addr(const mesh_addr_t *addr)
-{
-    if (!addr)
-    {
-        return;
-    }
+// Image queue for mesh power-save aware transmission
+typedef struct {
+  char path[64]; // Path to saved image on SD card
+  size_t size;   // Size of the image in bytes
+  bool pending;  // Whether this slot has a pending image
+} pending_image_t;
 
-    if (!s_root_addr_valid || memcmp(s_known_root_addr.addr, addr->addr, MWIFI_ADDR_LEN) != 0)
-    {
-        memcpy(s_known_root_addr.addr, addr->addr, MWIFI_ADDR_LEN);
-        s_root_addr_valid = true;
-        ESP_LOGI(TAG, "Tracking preferred root: " MACSTR, MAC2STR(s_known_root_addr.addr));
-    }
+static pending_image_t s_image_queue[IMAGE_QUEUE_MAX] = {0};
+static SemaphoreHandle_t s_queue_mutex = NULL;
+
+static void remember_root_addr(const mesh_addr_t *addr) {
+  if (!addr) {
+    return;
+  }
+
+  if (!s_root_addr_valid ||
+      memcmp(s_known_root_addr.addr, addr->addr, MWIFI_ADDR_LEN) != 0) {
+    memcpy(s_known_root_addr.addr, addr->addr, MWIFI_ADDR_LEN);
+    s_root_addr_valid = true;
+    ESP_LOGI(TAG, "Tracking preferred root: " MACSTR,
+             MAC2STR(s_known_root_addr.addr));
+  }
 }
 
 // Task handle for motion detection task
 static TaskHandle_t motion_detection_task_handle = NULL;
 
 // ISR handler for GPIO interrupt
-static void IRAM_ATTR gpio_isr_handler(void *arg)
-{
-    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+static void IRAM_ATTR gpio_isr_handler(void *arg) {
+  BaseType_t xHigherPriorityTaskWoken = pdFALSE;
 
-    // Notify the motion detection task
-    if (motion_detection_task_handle != NULL)
-    {
-        vTaskNotifyGiveFromISR(motion_detection_task_handle, &xHigherPriorityTaskWoken);
-        portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
-    }
+  // Notify the motion detection task
+  if (motion_detection_task_handle != NULL) {
+    vTaskNotifyGiveFromISR(motion_detection_task_handle,
+                           &xHigherPriorityTaskWoken);
+    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+  }
 }
 
-static bool is_sd_card_mounted(void)
-{
-    struct stat st;
-    return (stat("/sdcard", &st) == 0);
+static bool is_sd_card_mounted(void) {
+  struct stat st;
+  return (stat("/sdcard", &st) == 0);
 }
 
-static esp_err_t s_example_write_file(const char *path, uint8_t *data, size_t size)
-{
-    ESP_LOGI(TAG, "Writing binary file: %s (%zu bytes)", path, size);
-    
-    // Check if SD card is mounted
-    if (!is_sd_card_mounted()) {
-        ESP_LOGE(TAG, "SD card not mounted, cannot write file");
-        return ESP_ERR_NOT_FOUND;
-    }
-    
-    // Validate input parameters
-    if (path == NULL || data == NULL || size == 0) {
-        ESP_LOGE(TAG, "Invalid parameters for file write");
-        return ESP_ERR_INVALID_ARG;
-    }
-    
-    FILE *f = fopen(path, "wb");
-    if (f == NULL)
-    {
-        ESP_LOGE(TAG, "Failed to open file for writing: %s (errno: %d)", path, errno);
-        return ESP_FAIL;
-    }
-    
-    size_t written = fwrite(data, 1, size, f);
-    int fclose_result = fclose(f);
-    
-    if (fclose_result != 0) {
-        ESP_LOGE(TAG, "Failed to close file: %s (errno: %d)", path, errno);
-    }
+static esp_err_t s_example_write_file(const char *path, uint8_t *data,
+                                      size_t size) {
+  ESP_LOGI(TAG, "Writing binary file: %s (%zu bytes)", path, size);
 
-    if (written != size)
-    {
-        ESP_LOGE(TAG, "Failed to write complete data to file (wrote %zu of %zu bytes)", written, size);
-        return ESP_FAIL;
-    }
+  // Check if SD card is mounted
+  if (!is_sd_card_mounted()) {
+    ESP_LOGE(TAG, "SD card not mounted, cannot write file");
+    return ESP_ERR_NOT_FOUND;
+  }
 
-    ESP_LOGI(TAG, "Binary file written successfully: %zu bytes", written);
-    return ESP_OK;
+  // Validate input parameters
+  if (path == NULL || data == NULL || size == 0) {
+    ESP_LOGE(TAG, "Invalid parameters for file write");
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  FILE *f = fopen(path, "wb");
+  if (f == NULL) {
+    ESP_LOGE(TAG, "Failed to open file for writing: %s (errno: %d)", path,
+             errno);
+    return ESP_FAIL;
+  }
+
+  size_t written = fwrite(data, 1, size, f);
+  int fclose_result = fclose(f);
+
+  if (fclose_result != 0) {
+    ESP_LOGE(TAG, "Failed to close file: %s (errno: %d)", path, errno);
+  }
+
+  if (written != size) {
+    ESP_LOGE(TAG,
+             "Failed to write complete data to file (wrote %zu of %zu bytes)",
+             written, size);
+    return ESP_FAIL;
+  }
+
+  ESP_LOGI(TAG, "Binary file written successfully: %zu bytes", written);
+  return ESP_OK;
 }
 
 /**
  * @brief Task to capture and save photos periodically when mesh is ready
  */
-static void capture_photo_task(void *arg)
-{
-    ESP_LOGI(TAG, "Capture photo task started");
+static void capture_photo_task(void *arg) {
+  ESP_LOGW(TAG, "Capture photo task started");
 
-    /* Wait for mesh connection before attempting capture */
-    while (!mwifi_is_connected())
-    {
-        ESP_LOGW(TAG, "Waiting for mesh connection...");
-        vTaskDelay(1000 / portTICK_PERIOD_MS);
-    }
+  /* Wait for mesh connection before attempting capture */
+  while (!mwifi_is_connected()) {
+    ESP_LOGW(TAG, "Waiting for mesh connection...");
+    vTaskDelay(1000 / portTICK_PERIOD_MS);
+  }
 
-    for (int i = 0; i < 3; i++)
-    {
-        // Warm up camera
-        camera_fb_t *frame_buffer = esp_camera_fb_get();
-        if (!frame_buffer)
-        {
-            ESP_LOGE(TAG, "Failed to warm up camera on attempt %d", i + 1);
-            continue;
-        }
-        esp_camera_fb_return(frame_buffer);
+  for (int i = 0; i < 3; i++) {
+    // Warm up camera
+    camera_fb_t *frame_buffer = esp_camera_fb_get();
+    if (!frame_buffer) {
+      ESP_LOGE(TAG, "Failed to warm up camera on attempt %d", i + 1);
+      continue;
     }
-    
-    vTaskDelay(5 / portTICK_PERIOD_MS); // Short delay after warm-up
+    esp_camera_fb_return(frame_buffer);
+  }
 
-    /* Capture and save photo */
-    ESP_LOGI(TAG, "Capturing photo #%d...", g_photo_counter + 1);
-    esp_err_t ret = capture_and_save_photo(++g_photo_counter);
-    if (ret == ESP_OK)
-    {
-        ESP_LOGI(TAG, "Photo #%d captured and saved successfully!", g_photo_counter);
-    }
-    else
-    {
-        ESP_LOGE(TAG, "Failed to capture/save photo #%d: %s", g_photo_counter, esp_err_to_name(ret));
-    }
+  vTaskDelay(5 / portTICK_PERIOD_MS); // Short delay after warm-up
 
-    vTaskDelete(NULL);
+  /* Capture and save photo */
+  ESP_LOGW(TAG, "Capturing photo #%d...", g_photo_counter + 1);
+  esp_err_t ret = capture_and_save_photo(++g_photo_counter);
+  if (ret == ESP_OK) {
+    ESP_LOGW(TAG, "Photo #%d captured and saved successfully!",
+             g_photo_counter);
+  } else {
+    ESP_LOGE(TAG, "Failed to capture/save photo #%d: %s", g_photo_counter,
+             esp_err_to_name(ret));
+  }
+
+  vTaskDelete(NULL);
 }
 
 /**
  * @brief Task to handle motion detection notifications
  */
-static void motion_detection_task(void *arg)
-{
-    ESP_LOGI(TAG, "Motion detection task started");
+static void motion_detection_task(void *arg) {
+  ESP_LOGW(TAG, "Motion detection task started. Waiting 60s for sensor "
+                "auto-calibration...");
 
-    for (;;)
-    {
-        // Wait for notification from ISR
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+  vTaskDelay(60000 / portTICK_PERIOD_MS);
 
-        // Print motion detected message
-        ESP_LOGI(TAG, "*** MOVEMENT DETECTED! *** PIR sensor triggered");
+  ESP_LOGW(TAG, "PIR sensor auto-calibrated. Monitoring for motion...");
 
-        xTaskCreate(capture_photo_task, "capture_photo_task", 4 * 1024, NULL, CONFIG_MDF_TASK_DEFAULT_PRIOTY, NULL);
+  for (;;) {
+    // Wait for notification from ISR
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
-        // Optional: Add debouncing delay to prevent spam
-        vTaskDelay(500 / portTICK_PERIOD_MS);
-    }
+    // Print motion detected message
+    ESP_LOGW(TAG, "*** MOVEMENT DETECTED! *** PIR sensor triggered");
 
-    vTaskDelete(NULL);
+    xTaskCreate(capture_photo_task, "capture_photo_task", 4 * 1024, NULL,
+                CONFIG_MDF_TASK_DEFAULT_PRIOTY, NULL);
+
+    // Optional: Add debouncing delay to prevent spam
+    vTaskDelay(1000 / portTICK_PERIOD_MS);
+  }
+
+  vTaskDelete(NULL);
 }
 
+/**
+ * @brief Read image from SD card for transmission
+ */
+static uint8_t *read_image_from_sd(const char *path, size_t *out_size) {
+  FILE *f = fopen(path, "rb");
+  if (f == NULL) {
+    ESP_LOGE(TAG, "Failed to open image file: %s", path);
+    return NULL;
+  }
+
+  // Get file size
+  fseek(f, 0, SEEK_END);
+  size_t file_size = ftell(f);
+  fseek(f, 0, SEEK_SET);
+
+  if (file_size == 0) {
+    fclose(f);
+    return NULL;
+  }
+
+  // Allocate buffer in PSRAM if available
+  uint8_t *buffer =
+      heap_caps_malloc(file_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (buffer == NULL) {
+    buffer = malloc(file_size);
+  }
+  if (buffer == NULL) {
+    ESP_LOGE(TAG, "Failed to allocate memory for image: %zu bytes", file_size);
+    fclose(f);
+    return NULL;
+  }
+
+  size_t read_size = fread(buffer, 1, file_size, f);
+  fclose(f);
+
+  if (read_size != file_size) {
+    ESP_LOGE(TAG, "Failed to read complete image: %zu of %zu bytes", read_size,
+             file_size);
+    free(buffer);
+    return NULL;
+  }
+
+  *out_size = file_size;
+  return buffer;
+}
+
+/**
+ * @brief Task to transmit queued images when mesh network is active
+ */
+static void mesh_transmit_task(void *arg) {
+  ESP_LOGI(TAG, "Mesh transmit task started");
+
+  while (1) {
+    // Check if we should transmit (mesh connected AND device is active)
+    if (mwifi_is_connected() && esp_mesh_is_device_active() &&
+        !esp_mesh_is_root()) {
+      if (xSemaphoreTake(s_queue_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        for (int i = 0; i < IMAGE_QUEUE_MAX; i++) {
+          if (s_image_queue[i].pending) {
+            ESP_LOGW(TAG, "Transmitting queued image: %s",
+                     s_image_queue[i].path);
+
+            // Read image from SD card
+            size_t img_size = 0;
+            uint8_t *img_data =
+                read_image_from_sd(s_image_queue[i].path, &img_size);
+
+            if (img_data != NULL && img_size > 0) {
+              mwifi_data_type_t data_type = {0x0};
+              mdf_err_t mesh_ret =
+                  mwifi_write(NULL, &data_type, img_data, img_size, true);
+
+              if (mesh_ret == MDF_OK) {
+                ESP_LOGW(TAG,
+                         "Image sent over mesh successfully: %s (%zu bytes)",
+                         s_image_queue[i].path, img_size);
+                s_image_queue[i].pending = false; // Clear the slot
+              } else {
+                ESP_LOGE(TAG, "Failed to send image over mesh: %s",
+                         mdf_err_to_name(mesh_ret));
+                // Keep pending, will retry next active period
+              }
+              free(img_data);
+            } else {
+              ESP_LOGE(TAG,
+                       "Failed to read image from SD, removing from queue");
+              s_image_queue[i].pending = false; // Remove invalid entry
+            }
+
+            // Only send one image per active window to avoid overwhelming the
+            // network
+            xSemaphoreGive(s_queue_mutex);
+            vTaskDelay(500 /
+                       portTICK_PERIOD_MS); // Brief delay between transmissions
+
+            // Re-acquire mutex to continue checking
+            if (xSemaphoreTake(s_queue_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+              break;
+            }
+          }
+        }
+        xSemaphoreGive(s_queue_mutex);
+      }
+    }
+
+    // Poll interval - check every 200ms for active state
+    vTaskDelay(200 / portTICK_PERIOD_MS);
+  }
+
+  vTaskDelete(NULL);
+}
 
 // #define MEMORY_DEBUG
 
@@ -236,39 +356,34 @@ pin_configuration_t config = {
 };
 #endif // CONFIG_EXAMPLE_DEBUG_PIN_CONNECTIONS
 
-
 #if CONFIG_EXAMPLE_PIN_CARD_POWER_RESET
-static esp_err_t s_example_reset_card_power(void)
-{
-    esp_err_t ret = ESP_FAIL;
-    gpio_config_t io_conf = {
-        .mode = GPIO_MODE_OUTPUT,
-        .pin_bit_mask = (1ULL << CONFIG_EXAMPLE_PIN_CARD_POWER_RESET),
-    };
-    ret = gpio_config(&io_conf);
-    if (ret != ESP_OK)
-    {
-        ESP_LOGE(TAG, "Failed to config GPIO");
-        return ret;
-    }
+static esp_err_t s_example_reset_card_power(void) {
+  esp_err_t ret = ESP_FAIL;
+  gpio_config_t io_conf = {
+      .mode = GPIO_MODE_OUTPUT,
+      .pin_bit_mask = (1ULL << CONFIG_EXAMPLE_PIN_CARD_POWER_RESET),
+  };
+  ret = gpio_config(&io_conf);
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to config GPIO");
+    return ret;
+  }
 
-    ret = gpio_set_level(CONFIG_EXAMPLE_PIN_CARD_POWER_RESET, 1);
-    if (ret != ESP_OK)
-    {
-        ESP_LOGE(TAG, "Failed to set GPIO level");
-        return ret;
-    }
+  ret = gpio_set_level(CONFIG_EXAMPLE_PIN_CARD_POWER_RESET, 1);
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to set GPIO level");
+    return ret;
+  }
 
-    vTaskDelay(100 / portTICK_PERIOD_MS);
+  vTaskDelay(100 / portTICK_PERIOD_MS);
 
-    ret = gpio_set_level(CONFIG_EXAMPLE_PIN_CARD_POWER_RESET, 0);
-    if (ret != ESP_OK)
-    {
-        ESP_LOGE(TAG, "Failed to set GPIO level");
-        return ret;
-    }
+  ret = gpio_set_level(CONFIG_EXAMPLE_PIN_CARD_POWER_RESET, 0);
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to set GPIO level");
+    return ret;
+  }
 
-    return ESP_OK;
+  return ESP_OK;
 }
 #endif // CONFIG_EXAMPLE_PIN_CARD_POWER_RESET
 
@@ -276,133 +391,134 @@ static esp_err_t s_example_reset_card_power(void)
 
 static esp_netif_t *netif_sta = NULL;
 
-static mdf_err_t sd_init()
-{
-    /* Initialize SD card */
-    esp_err_t ret;
+static mdf_err_t sd_init() {
+  /* Initialize SD card */
+  esp_err_t ret;
 
-    // Options for mounting the filesystem.
-    // If format_if_mount_failed is set to true, SD card will be partitioned and
-    // formatted in case when mounting fails.
-    esp_vfs_fat_sdmmc_mount_config_t mount_config = {
+  // Options for mounting the filesystem.
+  // If format_if_mount_failed is set to true, SD card will be partitioned and
+  // formatted in case when mounting fails.
+  esp_vfs_fat_sdmmc_mount_config_t mount_config = {
 #ifdef CONFIG_EXAMPLE_FORMAT_IF_MOUNT_FAILED
-        .format_if_mount_failed = true,
+      .format_if_mount_failed = true,
 #else
-        .format_if_mount_failed = false,
+      .format_if_mount_failed = false,
 #endif // EXAMPLE_FORMAT_IF_MOUNT_FAILED
-        .max_files = 5,
-        .allocation_unit_size = 16 * 1024};
-    sdmmc_card_t *card;
-    const char mount_point[] = MOUNT_POINT;
-    ESP_LOGI(TAG, "Initializing SD card");
+      .max_files = 5,
+      .allocation_unit_size = 16 * 1024};
+  sdmmc_card_t *card;
+  const char mount_point[] = MOUNT_POINT;
+  ESP_LOGI(TAG, "Initializing SD card");
 
-    // Use settings defined above to initialize SD card and mount FAT filesystem.
-    // Note: esp_vfs_fat_sdmmc/sdspi_mount is all-in-one convenience functions.
-    // Please check its source code and implement error recovery when developing
-    // production applications.
+  // Use settings defined above to initialize SD card and mount FAT filesystem.
+  // Note: esp_vfs_fat_sdmmc/sdspi_mount is all-in-one convenience functions.
+  // Please check its source code and implement error recovery when developing
+  // production applications.
 
-    ESP_LOGI(TAG, "Using SDMMC peripheral");
+  ESP_LOGI(TAG, "Using SDMMC peripheral");
 
-    // By default, SD card frequency is initialized to SDMMC_FREQ_DEFAULT (20MHz)
-    // For setting a specific frequency, use host.max_freq_khz (range 400kHz - 40MHz for SDMMC)
-    // Example: for fixed frequency of 10MHz, use host.max_freq_khz = 10000;
-    sdmmc_host_t host = SDMMC_HOST_DEFAULT();
+  // By default, SD card frequency is initialized to SDMMC_FREQ_DEFAULT (20MHz)
+  // For setting a specific frequency, use host.max_freq_khz (range 400kHz -
+  // 40MHz for SDMMC) Example: for fixed frequency of 10MHz, use
+  // host.max_freq_khz = 10000;
+  sdmmc_host_t host = SDMMC_HOST_DEFAULT();
 #if CONFIG_EXAMPLE_SDMMC_SPEED_HS
-    host.max_freq_khz = SDMMC_FREQ_HIGHSPEED;
+  host.max_freq_khz = SDMMC_FREQ_HIGHSPEED;
 #elif CONFIG_EXAMPLE_SDMMC_SPEED_UHS_I_SDR50
-    host.slot = SDMMC_HOST_SLOT_0;
-    host.max_freq_khz = SDMMC_FREQ_SDR50;
-    host.flags &= ~SDMMC_HOST_FLAG_DDR;
+  host.slot = SDMMC_HOST_SLOT_0;
+  host.max_freq_khz = SDMMC_FREQ_SDR50;
+  host.flags &= ~SDMMC_HOST_FLAG_DDR;
 #elif CONFIG_EXAMPLE_SDMMC_SPEED_UHS_I_DDR50
-    host.slot = SDMMC_HOST_SLOT_0;
-    host.max_freq_khz = SDMMC_FREQ_DDR50;
+  host.slot = SDMMC_HOST_SLOT_0;
+  host.max_freq_khz = SDMMC_FREQ_DDR50;
 #elif CONFIG_EXAMPLE_SDMMC_SPEED_UHS_I_SDR104
-    host.slot = SDMMC_HOST_SLOT_0;
-    host.max_freq_khz = SDMMC_FREQ_SDR104;
-    host.flags &= ~SDMMC_HOST_FLAG_DDR;
+  host.slot = SDMMC_HOST_SLOT_0;
+  host.max_freq_khz = SDMMC_FREQ_SDR104;
+  host.flags &= ~SDMMC_HOST_FLAG_DDR;
 #endif
 
-    // For SoCs where the SD power can be supplied both via an internal or external (e.g. on-board LDO) power supply.
-    // When using specific IO pins (which can be used for ultra high-speed SDMMC) to connect to the SD card
-    // and the internal LDO power supply, we need to initialize the power supply first.
+  // For SoCs where the SD power can be supplied both via an internal or
+  // external (e.g. on-board LDO) power supply. When using specific IO pins
+  // (which can be used for ultra high-speed SDMMC) to connect to the SD card
+  // and the internal LDO power supply, we need to initialize the power supply
+  // first.
 #if CONFIG_EXAMPLE_SD_PWR_CTRL_LDO_INTERNAL_IO
-    sd_pwr_ctrl_ldo_config_t ldo_config = {
-        .ldo_chan_id = CONFIG_EXAMPLE_SD_PWR_CTRL_LDO_IO_ID,
-    };
-    sd_pwr_ctrl_handle_t pwr_ctrl_handle = NULL;
+  sd_pwr_ctrl_ldo_config_t ldo_config = {
+      .ldo_chan_id = CONFIG_EXAMPLE_SD_PWR_CTRL_LDO_IO_ID,
+  };
+  sd_pwr_ctrl_handle_t pwr_ctrl_handle = NULL;
 
-    ret = sd_pwr_ctrl_new_on_chip_ldo(&ldo_config, &pwr_ctrl_handle);
-    if (ret != ESP_OK)
-    {
-        ESP_LOGE(TAG, "Failed to create a new on-chip LDO power control driver");
-        return ret;
-    }
-    host.pwr_ctrl_handle = pwr_ctrl_handle;
+  ret = sd_pwr_ctrl_new_on_chip_ldo(&ldo_config, &pwr_ctrl_handle);
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to create a new on-chip LDO power control driver");
+    return ret;
+  }
+  host.pwr_ctrl_handle = pwr_ctrl_handle;
 #endif
 
 #if CONFIG_EXAMPLE_PIN_CARD_POWER_RESET
-    ESP_ERROR_CHECK(s_example_reset_card_power());
+  ESP_ERROR_CHECK(s_example_reset_card_power());
 #endif
 
-    // This initializes the slot without card detect (CD) and write protect (WP) signals.
-    // Modify slot_config.gpio_cd and slot_config.gpio_wp if your board has these signals.
-    sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
+  // This initializes the slot without card detect (CD) and write protect (WP)
+  // signals. Modify slot_config.gpio_cd and slot_config.gpio_wp if your board
+  // has these signals.
+  sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
 #if EXAMPLE_IS_UHS1
-    slot_config.flags |= SDMMC_SLOT_FLAG_UHS1;
+  slot_config.flags |= SDMMC_SLOT_FLAG_UHS1;
 #endif
 
-    // Set bus width to use:
+  // Set bus width to use:
 #ifdef CONFIG_EXAMPLE_SDMMC_BUS_WIDTH_4
-    slot_config.width = 4;
+  slot_config.width = 4;
 #else
-    slot_config.width = 1;
+  slot_config.width = 1;
 #endif
 
-    // On chips where the GPIOs used for SD card can be configured, set them in
-    // the slot_config structure:
+  // On chips where the GPIOs used for SD card can be configured, set them in
+  // the slot_config structure:
 #ifdef CONFIG_SOC_SDMMC_USE_GPIO_MATRIX
-    slot_config.clk = CONFIG_EXAMPLE_PIN_CLK;
-    slot_config.cmd = CONFIG_EXAMPLE_PIN_CMD;
-    slot_config.d0 = CONFIG_EXAMPLE_PIN_D0;
+  slot_config.clk = CONFIG_EXAMPLE_PIN_CLK;
+  slot_config.cmd = CONFIG_EXAMPLE_PIN_CMD;
+  slot_config.d0 = CONFIG_EXAMPLE_PIN_D0;
 #ifdef CONFIG_EXAMPLE_SDMMC_BUS_WIDTH_4
-    slot_config.d1 = CONFIG_EXAMPLE_PIN_D1;
-    slot_config.d2 = CONFIG_EXAMPLE_PIN_D2;
-    slot_config.d3 = CONFIG_EXAMPLE_PIN_D3;
+  slot_config.d1 = CONFIG_EXAMPLE_PIN_D1;
+  slot_config.d2 = CONFIG_EXAMPLE_PIN_D2;
+  slot_config.d3 = CONFIG_EXAMPLE_PIN_D3;
 #endif // CONFIG_EXAMPLE_SDMMC_BUS_WIDTH_4
 #endif // CONFIG_SOC_SDMMC_USE_GPIO_MATRIX
 
-    // Enable internal pullups on enabled pins. The internal pullups
-    // are insufficient however, please make sure 10k external pullups are
-    // connected on the bus. This is for debug / example purpose only.
-    slot_config.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
+  // Enable internal pullups on enabled pins. The internal pullups
+  // are insufficient however, please make sure 10k external pullups are
+  // connected on the bus. This is for debug / example purpose only.
+  slot_config.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
 
-    ESP_LOGI(TAG, "Mounting filesystem");
-    ret = esp_vfs_fat_sdmmc_mount(mount_point, &host, &slot_config, &mount_config, &card);
+  ESP_LOGI(TAG, "Mounting filesystem");
+  ret = esp_vfs_fat_sdmmc_mount(mount_point, &host, &slot_config, &mount_config,
+                                &card);
 
-    if (ret != ESP_OK)
-    {
-        if (ret == ESP_FAIL)
-        {
-            ESP_LOGE(TAG, "Failed to mount filesystem. "
-                          "If you want the card to be formatted, set the EXAMPLE_FORMAT_IF_MOUNT_FAILED menuconfig option.");
-        }
-        else
-        {
-            ESP_LOGE(TAG, "Failed to initialize the card (%s). "
-                          "Make sure SD card lines have pull-up resistors in place.",
-                     esp_err_to_name(ret));
+  if (ret != ESP_OK) {
+    if (ret == ESP_FAIL) {
+      ESP_LOGE(TAG, "Failed to mount filesystem. "
+                    "If you want the card to be formatted, set the "
+                    "EXAMPLE_FORMAT_IF_MOUNT_FAILED menuconfig option.");
+    } else {
+      ESP_LOGE(TAG,
+               "Failed to initialize the card (%s). "
+               "Make sure SD card lines have pull-up resistors in place.",
+               esp_err_to_name(ret));
 #ifdef CONFIG_EXAMPLE_DEBUG_PIN_CONNECTIONS
-            check_sd_card_pins(&config, pin_count);
+      check_sd_card_pins(&config, pin_count);
 #endif
-        }
-        return ret;
     }
-    ESP_LOGI(TAG, "Filesystem mounted");
-
-    // Card has been initialized, print its properties
-    sdmmc_card_print_info(stdout, card);
-
     return ret;
+  }
+  ESP_LOGI(TAG, "Filesystem mounted");
+
+  // Card has been initialized, print its properties
+  sdmmc_card_print_info(stdout, card);
+
+  return ret;
 }
 
 /**
@@ -410,136 +526,129 @@ static mdf_err_t sd_init()
  * @param photo_counter Counter for unique photo naming
  * @return ESP_OK on success, error code otherwise
  */
-static esp_err_t capture_and_save_photo(int photo_counter)
-{
-    if (!camera_is_supported())
-    {
-        ESP_LOGW(TAG, "Camera not supported on this platform");
-        return ESP_ERR_NOT_SUPPORTED;
-    }
+static esp_err_t capture_and_save_photo(int photo_counter) {
+  if (!camera_is_supported()) {
+    ESP_LOGW(TAG, "Camera not supported on this platform");
+    return ESP_ERR_NOT_SUPPORTED;
+  }
 
-    camera_fb_t *frame_buffer = camera_capture_photo();
-    if (frame_buffer == NULL)
-    {
-        ESP_LOGE(TAG, "Failed to capture photo");
-        return ESP_FAIL;
-    }
+  camera_fb_t *frame_buffer = camera_capture_photo();
+  if (frame_buffer == NULL) {
+    ESP_LOGE(TAG, "Failed to capture photo");
+    return ESP_FAIL;
+  }
 
-    /* Create unique filename with counter */
-    char photo_path[64];
-    snprintf(photo_path, sizeof(photo_path), "/sdcard/pic_%d.jpg", photo_counter);
+  /* Create unique filename with counter */
+  char photo_path[64];
+  snprintf(photo_path, sizeof(photo_path), "/sdcard/pic_%d.jpg", photo_counter);
 
-    ESP_LOGI(TAG, "Attempting to save photo to: %s", photo_path);
+  ESP_LOGI(TAG, "Attempting to save photo to: %s", photo_path);
 
-    /* Save photo to SD card */
-    esp_err_t write_ret = s_example_write_file(photo_path, frame_buffer->buf, frame_buffer->len);
-    if (write_ret != ESP_OK)
-    {
-        ESP_LOGE(TAG, "Failed to write photo to SD card: %s", esp_err_to_name(write_ret));
-        camera_return_frame_buffer(frame_buffer);
-        return write_ret;
-    }
-
-    ESP_LOGI(TAG, "Photo saved to: %s (size: %d bytes)", photo_path, frame_buffer->len);
-
-    /* Send image over mesh (only if connected) */
-    if (mwifi_is_connected())
-    {
-        ESP_LOGI(TAG, "Sending image over mesh, size: %d bytes", frame_buffer->len);
-        mwifi_data_type_t data_type = {0x0};
-
-        if (esp_mesh_is_root())
-        {
-            ESP_LOGI(TAG, "Node is root, skipping mesh transmission");
-            camera_return_frame_buffer(frame_buffer);
-            return ESP_OK;
-        }
-
-        mdf_err_t mesh_ret = mwifi_write(NULL, &data_type, frame_buffer->buf, frame_buffer->len, true);
-        if (mesh_ret != MDF_OK)
-        {
-            ESP_LOGE(TAG, "Failed to send image over mesh: %s", mdf_err_to_name(mesh_ret));
-        }
-        else
-        {
-            ESP_LOGI(TAG, "Image sent over mesh successfully!");
-        }
-    }
-    else
-    {
-        ESP_LOGW(TAG, "Mesh not connected, skipping mesh transmission");
-    }
-
-    /* Return the frame buffer */
+  /* Save photo to SD card */
+  esp_err_t write_ret =
+      s_example_write_file(photo_path, frame_buffer->buf, frame_buffer->len);
+  if (write_ret != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to write photo to SD card: %s",
+             esp_err_to_name(write_ret));
     camera_return_frame_buffer(frame_buffer);
+    return write_ret;
+  }
 
-    return ESP_OK;
+  ESP_LOGI(TAG, "Photo saved to: %s (size: %d bytes)", photo_path,
+           frame_buffer->len);
+
+  /* Queue image for mesh transmission (will send when network is active) */
+  if (!esp_mesh_is_root()) {
+    if (xSemaphoreTake(s_queue_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+      bool queued = false;
+      for (int i = 0; i < IMAGE_QUEUE_MAX; i++) {
+        if (!s_image_queue[i].pending) {
+          strncpy(s_image_queue[i].path, photo_path,
+                  sizeof(s_image_queue[i].path) - 1);
+          s_image_queue[i].size = frame_buffer->len;
+          s_image_queue[i].pending = true;
+          queued = true;
+          ESP_LOGW(TAG, "Queued image for mesh transmission: %s (slot %d)",
+                   photo_path, i);
+          break;
+        }
+      }
+      xSemaphoreGive(s_queue_mutex);
+      if (!queued) {
+        ESP_LOGW(TAG, "Image queue full, image will not be sent over mesh");
+      }
+    }
+  } else {
+    ESP_LOGI(TAG, "Node is root, skipping mesh transmission queue");
+  }
+
+  /* Return the frame buffer */
+  camera_return_frame_buffer(frame_buffer);
+
+  return ESP_OK;
 }
 
 /**
  * @brief Timed printing system information
  */
-static void print_system_info_timercb(TimerHandle_t timer)
-{
-    uint8_t primary = 0;
-    wifi_second_chan_t second = 0;
-    mesh_addr_t parent_bssid = {0};
-    uint8_t sta_mac[MWIFI_ADDR_LEN] = {0};
-    wifi_sta_list_t wifi_sta_list = {0x0};
+static void print_system_info_timercb(TimerHandle_t timer) {
+  uint8_t primary = 0;
+  wifi_second_chan_t second = 0;
+  mesh_addr_t parent_bssid = {0};
+  uint8_t sta_mac[MWIFI_ADDR_LEN] = {0};
+  wifi_sta_list_t wifi_sta_list = {0x0};
 
-    esp_wifi_get_mac(ESP_IF_WIFI_STA, sta_mac);
-    esp_wifi_ap_get_sta_list(&wifi_sta_list);
-    esp_wifi_get_channel(&primary, &second);
-    esp_mesh_get_parent_bssid(&parent_bssid);
+  esp_wifi_get_mac(ESP_IF_WIFI_STA, sta_mac);
+  esp_wifi_ap_get_sta_list(&wifi_sta_list);
+  esp_wifi_get_channel(&primary, &second);
+  esp_mesh_get_parent_bssid(&parent_bssid);
 
-    MDF_LOGI("System information, channel: %d, layer: %d, self mac: " MACSTR ", parent bssid: " MACSTR
-             ", parent rssi: %d, node num: %d, free heap: %" PRIu32,
-             primary,
-             esp_mesh_get_layer(), MAC2STR(sta_mac), MAC2STR(parent_bssid.addr),
-             mwifi_get_parent_rssi(), esp_mesh_get_total_node_num(), esp_get_free_heap_size());
+  MDF_LOGI("System information, channel: %d, layer: %d, self mac: " MACSTR
+           ", parent bssid: " MACSTR
+           ", parent rssi: %d, node num: %d, free heap: %" PRIu32,
+           primary, esp_mesh_get_layer(), MAC2STR(sta_mac),
+           MAC2STR(parent_bssid.addr), mwifi_get_parent_rssi(),
+           esp_mesh_get_total_node_num(), esp_get_free_heap_size());
 
-    for (int i = 0; i < wifi_sta_list.num; i++)
-    {
-        MDF_LOGI("Child mac: " MACSTR, MAC2STR(wifi_sta_list.sta[i].mac));
-    }
+  for (int i = 0; i < wifi_sta_list.num; i++) {
+    MDF_LOGI("Child mac: " MACSTR, MAC2STR(wifi_sta_list.sta[i].mac));
+  }
 
 #ifdef MEMORY_DEBUG
 
-    if (!heap_caps_check_integrity_all(true))
-    {
-        MDF_LOGE("At least one heap is corrupt");
-    }
+  if (!heap_caps_check_integrity_all(true)) {
+    MDF_LOGE("At least one heap is corrupt");
+  }
 
-    mdf_mem_print_heap();
-    mdf_mem_print_record();
-    mdf_mem_print_task();
+  mdf_mem_print_heap();
+  mdf_mem_print_record();
+  mdf_mem_print_task();
 #endif /**< MEMORY_DEBUG */
 }
 
-static mdf_err_t wifi_init()
-{
-    mdf_err_t ret = nvs_flash_init();
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+static mdf_err_t wifi_init() {
+  mdf_err_t ret = nvs_flash_init();
+  wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
 
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
-    {
-        MDF_ERROR_ASSERT(nvs_flash_erase());
-        ret = nvs_flash_init();
-    }
+  if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
+      ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    MDF_ERROR_ASSERT(nvs_flash_erase());
+    ret = nvs_flash_init();
+  }
 
-    MDF_ERROR_ASSERT(ret);
+  MDF_ERROR_ASSERT(ret);
 
-    MDF_ERROR_ASSERT(esp_netif_init());
-    MDF_ERROR_ASSERT(esp_event_loop_create_default());
-    ESP_ERROR_CHECK(esp_netif_create_default_wifi_mesh_netifs(&netif_sta, NULL));
-    MDF_ERROR_ASSERT(esp_wifi_init(&cfg));
-    MDF_ERROR_ASSERT(esp_wifi_set_storage(WIFI_STORAGE_FLASH));
-    MDF_ERROR_ASSERT(esp_wifi_set_mode(WIFI_MODE_STA));
-    MDF_ERROR_ASSERT(esp_wifi_set_ps(WIFI_PS_NONE));
-    MDF_ERROR_ASSERT(esp_mesh_set_6m_rate(false));
-    MDF_ERROR_ASSERT(esp_wifi_start());
+  MDF_ERROR_ASSERT(esp_netif_init());
+  MDF_ERROR_ASSERT(esp_event_loop_create_default());
+  ESP_ERROR_CHECK(esp_netif_create_default_wifi_mesh_netifs(&netif_sta, NULL));
+  MDF_ERROR_ASSERT(esp_wifi_init(&cfg));
+  MDF_ERROR_ASSERT(esp_wifi_set_storage(WIFI_STORAGE_FLASH));
+  MDF_ERROR_ASSERT(esp_wifi_set_mode(WIFI_MODE_STA));
+  MDF_ERROR_ASSERT(esp_wifi_set_ps(WIFI_PS_NONE));
+  MDF_ERROR_ASSERT(esp_mesh_set_6m_rate(false));
+  MDF_ERROR_ASSERT(esp_wifi_start());
 
-    return MDF_OK;
+  return MDF_OK;
 }
 
 /**
@@ -550,175 +659,180 @@ static mdf_err_t wifi_init()
  *     2. Do not consume a lot of memory in the callback function.
  *        The task memory of the callback function is only 4KB.
  */
-static mdf_err_t event_loop_cb(mdf_event_loop_t event, void *ctx)
-{
-    MDF_LOGI("event_loop_cb, event: %" PRIu32, event);
+static mdf_err_t event_loop_cb(mdf_event_loop_t event, void *ctx) {
+  MDF_LOGI("event_loop_cb, event: %" PRIu32, event);
 
-    switch (event)
-    {
-    case MDF_EVENT_MWIFI_STARTED:
-        MDF_LOGI("MESH is started");
-        break;
+  switch (event) {
+  case MDF_EVENT_MWIFI_STARTED:
+    MDF_LOGI("MESH is started");
+    break;
 
-    case MDF_EVENT_MWIFI_PARENT_CONNECTED:
-        MDF_LOGI("Parent is connected on station interface");
+  case MDF_EVENT_MWIFI_PARENT_CONNECTED:
+    MDF_LOGI("Parent is connected on station interface");
 
-        if (esp_mesh_is_root())
-        {
-            esp_netif_dhcpc_start(netif_sta);
-        }
-
-        mesh_addr_t parent = {0};
-        esp_mesh_get_parent_bssid(&parent);
-
-        if (!esp_mesh_is_root())
-        {
-            remember_root_addr(&parent);
-        }
-
-        break;
-
-    case MDF_EVENT_MWIFI_PARENT_DISCONNECTED:
-        MDF_LOGI("Parent is disconnected on station interface");
-        break;
-
-    case MDF_EVENT_MWIFI_ROOT_SWITCH_REQ:
-    {
-        ESP_LOGI(TAG, "Root switch requested");
-        const mesh_event_root_switch_req_t *switch_req = (const mesh_event_root_switch_req_t *)ctx;
-
-        mesh_addr_t candidate = {0};
-        mesh_vote_reason_t reason = MESH_VOTE_REASON_ROOT_INITIATED;
-
-        if (switch_req != NULL)
-        {
-            candidate = switch_req->rc_addr;
-            reason = switch_req->reason;
-            remember_root_addr(&candidate);
-            ESP_LOGI(TAG, "Switch candidate: " MACSTR ", reason: %d", MAC2STR(candidate.addr), reason);
-        }
-
-        if (esp_mesh_is_root())
-        {
-            ESP_LOGI(TAG, "Waiving temporary root role");
-            esp_mesh_waive_root(NULL, reason);
-        }
-
-        break;
+    if (esp_mesh_is_root()) {
+      esp_netif_dhcpc_start(netif_sta);
     }
 
-    case MDF_EVENT_MWIFI_ROUTING_TABLE_ADD:
-    case MDF_EVENT_MWIFI_ROUTING_TABLE_REMOVE:
-        MDF_LOGI("total_num: %d", esp_mesh_get_total_node_num());
-        break;
+    mesh_addr_t parent = {0};
+    esp_mesh_get_parent_bssid(&parent);
 
-    case MDF_EVENT_MWIFI_ROOT_GOT_IP:
-    {
-        MDF_LOGI("Root obtains the IP address. It is posted by LwIP stack automatically");
-        break;
+    if (!esp_mesh_is_root()) {
+      remember_root_addr(&parent);
     }
 
-    default:
-        break;
+    break;
+
+  case MDF_EVENT_MWIFI_PARENT_DISCONNECTED:
+    MDF_LOGI("Parent is disconnected on station interface");
+    break;
+
+  case MDF_EVENT_MWIFI_ROOT_SWITCH_REQ: {
+    ESP_LOGI(TAG, "Root switch requested");
+    const mesh_event_root_switch_req_t *switch_req =
+        (const mesh_event_root_switch_req_t *)ctx;
+
+    mesh_addr_t candidate = {0};
+    mesh_vote_reason_t reason = MESH_VOTE_REASON_ROOT_INITIATED;
+
+    if (switch_req != NULL) {
+      candidate = switch_req->rc_addr;
+      reason = switch_req->reason;
+      remember_root_addr(&candidate);
+      ESP_LOGI(TAG, "Switch candidate: " MACSTR ", reason: %d",
+               MAC2STR(candidate.addr), reason);
     }
 
-    return MDF_OK;
+    if (esp_mesh_is_root()) {
+      ESP_LOGI(TAG, "Waiving temporary root role");
+      esp_mesh_waive_root(NULL, reason);
+    }
+
+    break;
+  }
+
+  case MDF_EVENT_MWIFI_ROUTING_TABLE_ADD:
+  case MDF_EVENT_MWIFI_ROUTING_TABLE_REMOVE:
+    MDF_LOGI("total_num: %d", esp_mesh_get_total_node_num());
+    break;
+
+  case MDF_EVENT_MWIFI_ROOT_GOT_IP: {
+    MDF_LOGI("Root obtains the IP address. It is posted by LwIP stack "
+             "automatically");
+    break;
+  }
+
+  default:
+    break;
+  }
+
+  return MDF_OK;
 }
 
-void app_main()
-{
-    /* Initialize camera */
-    if (camera_is_supported())
-    {
-        if (camera_init() != ESP_OK)
-        {
-            ESP_LOGE(TAG, "Camera initialization failed, exiting");
-            return;
-        }
+void app_main() {
+  /* Initialize camera */
+  if (camera_is_supported()) {
+    if (camera_init() != ESP_OK) {
+      ESP_LOGE(TAG, "Camera initialization failed, exiting");
+      return;
     }
-    else
-    {
-        ESP_LOGW(TAG, "Camera not supported, continuing with SD card only");
-    }
+  } else {
+    ESP_LOGW(TAG, "Camera not supported, continuing with SD card only");
+  }
 
-    /* Initialize SD card for all nodes */
-    ESP_LOGI(TAG, "Initializing SD card...");
-    mdf_err_t sd_ret = sd_init();
-    if (sd_ret != ESP_OK)
-    {
-        ESP_LOGE(TAG, "SD card initialization failed: %s", esp_err_to_name(sd_ret));
-        ESP_LOGE(TAG, "Continuing without SD card functionality");
-    }
-    else
-    {
-        ESP_LOGI(TAG, "SD card initialized successfully");
-    }
+  /* Initialize SD card for all nodes */
+  ESP_LOGI(TAG, "Initializing SD card...");
+  mdf_err_t sd_ret = sd_init();
+  if (sd_ret != ESP_OK) {
+    ESP_LOGE(TAG, "SD card initialization failed: %s", esp_err_to_name(sd_ret));
+    ESP_LOGE(TAG, "Continuing without SD card functionality");
+  } else {
+    ESP_LOGI(TAG, "SD card initialized successfully");
+  }
 
-    mwifi_init_config_t cfg = MWIFI_INIT_CONFIG_DEFAULT();
-    mwifi_config_t config = {
-        .router_ssid = CONFIG_ROUTER_SSID,
-        .router_password = CONFIG_ROUTER_PASSWORD,
-        .mesh_id = CONFIG_MESH_ID,
-        .mesh_password = CONFIG_MESH_PASSWORD,
-        .mesh_type = MWIFI_MESH_NODE,
-    };
+  mwifi_init_config_t cfg = MWIFI_INIT_CONFIG_DEFAULT();
+  mwifi_config_t config = {
+      .router_ssid = CONFIG_ROUTER_SSID,
+      .router_password = CONFIG_ROUTER_PASSWORD,
+      .mesh_id = CONFIG_MESH_ID,
+      .mesh_password = CONFIG_MESH_PASSWORD,
+      .mesh_type = MWIFI_MESH_NODE,
+  };
 
-    /**
-     * @brief Set the log level for serial port printing.
-     */
-    esp_log_level_set("*", ESP_LOG_INFO);
-    esp_log_level_set(TAG, ESP_LOG_DEBUG);
+  /**
+   * @brief Set the log level for serial port printing.
+   */
+  esp_log_level_set("*", ESP_LOG_INFO);
+  esp_log_level_set(TAG, ESP_LOG_DEBUG);
 
-    /**
-     * @brief Initialize wifi mesh.
-     */
-    MDF_ERROR_ASSERT(mdf_event_loop_init(event_loop_cb));
-    MDF_ERROR_ASSERT(wifi_init());
-    MDF_ERROR_ASSERT(mwifi_init(&cfg));
-    MDF_ERROR_ASSERT(mwifi_set_config(&config));
-    MDF_ERROR_ASSERT(mwifi_start());
+  /**
+   * @brief Initialize wifi mesh.
+   */
+  MDF_ERROR_ASSERT(mdf_event_loop_init(event_loop_cb));
+  MDF_ERROR_ASSERT(wifi_init());
+  MDF_ERROR_ASSERT(mwifi_init(&cfg));
+  MDF_ERROR_ASSERT(mwifi_set_config(&config));
+  MDF_ERROR_ASSERT(mwifi_start());
 
-    /**
-     * @brief select/extend a group memebership here
-     *      group id can be a custom address
-     */
-    const uint8_t group_id_list[2][6] = {{0x01, 0x00, 0x5e, 0xae, 0xae, 0xae},
-                                         {0x01, 0x00, 0x5e, 0xae, 0xae, 0xaf}};
+  /**
+   * @brief select/extend a group memebership here
+   *      group id can be a custom address
+   */
+  const uint8_t group_id_list[2][6] = {{0x01, 0x00, 0x5e, 0xae, 0xae, 0xae},
+                                       {0x01, 0x00, 0x5e, 0xae, 0xae, 0xaf}};
 
-    MDF_ERROR_ASSERT(esp_mesh_set_group_id((mesh_addr_t *)group_id_list,
-                                           sizeof(group_id_list) / sizeof(group_id_list[0])));
+  MDF_ERROR_ASSERT(
+      esp_mesh_set_group_id((mesh_addr_t *)group_id_list,
+                            sizeof(group_id_list) / sizeof(group_id_list[0])));
 
-    ESP_LOGI(TAG, "Mesh initialization complete");
+  ESP_LOGI(TAG, "Mesh initialization complete");
 
-    TimerHandle_t timer = xTimerCreate("print_system_info", 10000 / portTICK_PERIOD_MS,
-                                       true, NULL, print_system_info_timercb);
-    xTimerStart(timer, 0);
+  TimerHandle_t timer =
+      xTimerCreate("print_system_info", 10000 / portTICK_PERIOD_MS, true, NULL,
+                   print_system_info_timercb);
+  xTimerStart(timer, 0);
 
+  // MDF_LOGI("Creating capture photo task...");
+  // xTaskCreate(capture_photo_task, "capture_photo_task", 4 * 1024, NULL,
+  // CONFIG_MDF_TASK_DEFAULT_PRIOTY, NULL);
 
-    // MDF_LOGI("Creating capture photo task...");
-    // xTaskCreate(capture_photo_task, "capture_photo_task", 4 * 1024, NULL, CONFIG_MDF_TASK_DEFAULT_PRIOTY, NULL);
+  // Create motion detection task
+  ESP_LOGI(TAG, "Creating motion detection task...");
+  BaseType_t ret_task =
+      xTaskCreate(motion_detection_task, "motion_detection", 2048, NULL, 5,
+                  &motion_detection_task_handle);
+  if (ret_task != pdPASS) {
+    ESP_LOGE(TAG, "Failed to create motion detection task");
+    return;
+  }
 
-    // Create motion detection task
-    ESP_LOGI(TAG, "Creating motion detection task...");
-    BaseType_t ret_task = xTaskCreate(motion_detection_task, "motion_detection", 2048, NULL, 5, &motion_detection_task_handle);
-    if (ret_task != pdPASS)
-    {
-        ESP_LOGE(TAG, "Failed to create motion detection task");
-        return;
-    }
+  // Configure GPIO 12 as input with pull-down and interrupt on rising edge
+  gpio_config_t io_conf = {
+      .intr_type = GPIO_INTR_POSEDGE,
+      .mode = GPIO_MODE_INPUT,
+      .pin_bit_mask = (1ULL << PIR_SENSOR_PIN),
+      .pull_down_en = 1,
+      .pull_up_en = 0,
+  };
+  gpio_config(&io_conf);
 
-    // Configure GPIO 12 as input with pull-down and interrupt on rising edge
-    gpio_config_t io_conf = {
-        .intr_type = GPIO_INTR_POSEDGE,
-        .mode = GPIO_MODE_INPUT,
-        .pin_bit_mask = (1ULL << PIR_SENSOR_PIN),
-        .pull_down_en = 1,
-        .pull_up_en = 0,
-    };
-    gpio_config(&io_conf);
+  // Install GPIO ISR service and add handler
+  // gpio_install_isr_service(0); // already installed
+  gpio_isr_handler_add(PIR_SENSOR_PIN, gpio_isr_handler, NULL);
 
-    // Install GPIO ISR service and add handler
-    // gpio_install_isr_service(0); // already installed
-    gpio_isr_handler_add(PIR_SENSOR_PIN, gpio_isr_handler, NULL);
+  // Initialize image queue mutex
+  s_queue_mutex = xSemaphoreCreateMutex();
+  if (s_queue_mutex == NULL) {
+    ESP_LOGE(TAG, "Failed to create queue mutex");
+    return;
+  }
 
+  // Create mesh transmit task for power-save aware transmission
+  ESP_LOGI(TAG, "Creating mesh transmit task...");
+  BaseType_t ret_transmit =
+      xTaskCreate(mesh_transmit_task, "mesh_transmit", 4 * 1024, NULL,
+                  CONFIG_MDF_TASK_DEFAULT_PRIOTY, NULL);
+  if (ret_transmit != pdPASS) {
+    ESP_LOGE(TAG, "Failed to create mesh transmit task");
+  }
 }
