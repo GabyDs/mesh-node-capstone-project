@@ -70,3 +70,5 @@ managed_components/
 
 # ESP-MDF specific ignores
 components/m*
+
+.cache/
