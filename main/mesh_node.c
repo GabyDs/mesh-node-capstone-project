@@ -44,8 +44,12 @@ static const char *TAG = "mesh_node";
 static mesh_addr_t s_known_root_addr = {0};
 static bool s_root_addr_valid = false;
 
+// Flag to track SD card mount status
+static bool s_sd_card_available = false;
+
 // Function prototypes
 static esp_err_t capture_and_save_photo(int photo_counter);
+static esp_err_t send_image_directly(uint8_t *data, size_t size);
 
 // Global counter for photo naming
 static int g_photo_counter = 0;
@@ -246,6 +250,46 @@ static uint8_t *read_image_from_sd(const char *path, size_t *out_size) {
   *out_size = file_size;
   return buffer;
 }
+
+/**
+ * @brief Send image directly over mesh without SD card storage
+ * @param data Pointer to image data
+ * @param size Size of image data in bytes
+ * @return ESP_OK on success, error code otherwise
+ */
+static esp_err_t send_image_directly(uint8_t *data, size_t size){
+  if (data == NULL || size == 0){
+    ESP_LOGE(TAG, "Invalid image data for direct send");
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  // Wait for mesh to be connected and active
+  int retry_count = 0;
+  const int max_retries = 50; // 10 second max wait (200ms * 50)
+
+  while (retry_count < max_retries){
+    if (mwifi_is_connected() && esp_mesh_is_device_active()){
+      mwifi_data_type_t data_type = {0x0};
+      mdf_err_t mesh_ret = mwifi_write(NULL, &data_type, data, size, true);
+
+      if (mesh_ret == MDF_OK){
+        ESP_LOGW(TAG, "Image sent directly over mesh successfully (%zu bytes)", size);
+        return ESP_OK;
+      } else {
+        ESP_LOGE(TAG, "Failed to send image directly over mesh: %s",
+                 mdf_err_to_name(mesh_ret));
+        return ESP_FAIL;
+      }
+    }
+
+    retry_count++;
+    vTaskDelay(200 / portTICK_PERIOD_MS);
+  }
+
+  ESP_LOGE(TAG, "Mesh not connected/active after waiting, cannot send image directly");
+  return ESP_ERR_TIMEOUT;
+}
+
 
 /**
  * @brief Task to transmit queued images when mesh network is active
@@ -538,48 +582,63 @@ static esp_err_t capture_and_save_photo(int photo_counter) {
     return ESP_FAIL;
   }
 
-  /* Create unique filename with counter */
-  char photo_path[64];
-  snprintf(photo_path, sizeof(photo_path), "/sdcard/pic_%d.jpg", photo_counter);
+  esp_err_t ret = ESP_OK;
 
-  ESP_LOGI(TAG, "Attempting to save photo to: %s", photo_path);
+  if (s_sd_card_available){
+    /* Create unique filename with counter */
+    char photo_path[64];
+    snprintf(photo_path, sizeof(photo_path), "/sdcard/pic_%d.jpg", photo_counter);
 
-  /* Save photo to SD card */
-  esp_err_t write_ret =
-      s_example_write_file(photo_path, frame_buffer->buf, frame_buffer->len);
-  if (write_ret != ESP_OK) {
-    ESP_LOGE(TAG, "Failed to write photo to SD card: %s",
-             esp_err_to_name(write_ret));
-    camera_return_frame_buffer(frame_buffer);
-    return write_ret;
-  }
+    ESP_LOGI(TAG, "Attempting to save photo to: %s", photo_path);
 
-  ESP_LOGI(TAG, "Photo saved to: %s (size: %d bytes)", photo_path,
-           frame_buffer->len);
+    /* Save photo to SD card */
+    esp_err_t write_ret =
+        s_example_write_file(photo_path, frame_buffer->buf, frame_buffer->len);
+    if (write_ret != ESP_OK) {
+      ESP_LOGE(TAG, "Failed to write photo to SD card: %s",
+              esp_err_to_name(write_ret));
+      camera_return_frame_buffer(frame_buffer);
+      return write_ret;
+    }
 
-  /* Queue image for mesh transmission (will send when network is active) */
-  if (!esp_mesh_is_root()) {
-    if (xSemaphoreTake(s_queue_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-      bool queued = false;
-      for (int i = 0; i < IMAGE_QUEUE_MAX; i++) {
-        if (!s_image_queue[i].pending) {
-          strncpy(s_image_queue[i].path, photo_path,
-                  sizeof(s_image_queue[i].path) - 1);
-          s_image_queue[i].size = frame_buffer->len;
-          s_image_queue[i].pending = true;
-          queued = true;
-          ESP_LOGW(TAG, "Queued image for mesh transmission: %s (slot %d)",
-                   photo_path, i);
-          break;
+    ESP_LOGI(TAG, "Photo saved to: %s (size: %d bytes)", photo_path,
+            frame_buffer->len);
+
+    /* Queue image for mesh transmission (will send when network is active) */
+    if (!esp_mesh_is_root()) {
+      if (xSemaphoreTake(s_queue_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        bool queued = false;
+        for (int i = 0; i < IMAGE_QUEUE_MAX; i++) {
+          if (!s_image_queue[i].pending) {
+            strncpy(s_image_queue[i].path, photo_path,
+                    sizeof(s_image_queue[i].path) - 1);
+            s_image_queue[i].size = frame_buffer->len;
+            s_image_queue[i].pending = true;
+            queued = true;
+            ESP_LOGW(TAG, "Queued image for mesh transmission: %s (slot %d)",
+                    photo_path, i);
+            break;
+          }
+        }
+        xSemaphoreGive(s_queue_mutex);
+        if (!queued) {
+          ESP_LOGW(TAG, "Image queue full, image will not be sent over mesh");
         }
       }
-      xSemaphoreGive(s_queue_mutex);
-      if (!queued) {
-        ESP_LOGW(TAG, "Image queue full, image will not be sent over mesh");
-      }
+    } else {
+      ESP_LOGI(TAG, "Node is root, skipping mesh transmission queue");
     }
   } else {
-    ESP_LOGI(TAG, "Node is root, skipping mesh transmission queue");
+    /* SD card NOT available - send directly over mesh from buffer */
+    ESP_LOGW(TAG, "SD card not available, sending image directly over mesh (%d bytes)", frame_buffer->len);
+    
+    ret = send_image_directly(frame_buffer->buf, frame_buffer->len);
+    if (ret == ESP_OK){
+      ESP_LOGW(TAG, "Photo #%d sent directly over mesh (no SD storage)", photo_counter);
+    } else {
+      ESP_LOGE(TAG, "Failed to send photo #%d directly over mesh: %s", photo_counter,
+               esp_err_to_name(ret));
+    }
   }
 
   /* Return the frame buffer */
@@ -745,9 +804,11 @@ void app_main() {
   mdf_err_t sd_ret = sd_init();
   if (sd_ret != ESP_OK) {
     ESP_LOGE(TAG, "SD card initialization failed: %s", esp_err_to_name(sd_ret));
-    ESP_LOGE(TAG, "Continuing without SD card functionality");
+    ESP_LOGE(TAG, "Continuing WITHOUT SD card - images will be sent directly over mesh");
+    s_sd_card_available = false;
   } else {
     ESP_LOGI(TAG, "SD card initialized successfully");
+    s_sd_card_available = true;
   }
 
   mwifi_init_config_t cfg = MWIFI_INIT_CONFIG_DEFAULT();
@@ -827,12 +888,16 @@ void app_main() {
     return;
   }
 
-  // Create mesh transmit task for power-save aware transmission
-  ESP_LOGI(TAG, "Creating mesh transmit task...");
-  BaseType_t ret_transmit =
-      xTaskCreate(mesh_transmit_task, "mesh_transmit", 4 * 1024, NULL,
-                  CONFIG_MDF_TASK_DEFAULT_PRIOTY, NULL);
-  if (ret_transmit != pdPASS) {
-    ESP_LOGE(TAG, "Failed to create mesh transmit task");
+  // Create mesh transmit task only if SD card is available (queue-based transmission)
+  if (s_sd_card_available){
+    ESP_LOGI(TAG, "Creating mesh transmit task...");
+    BaseType_t ret_transmit =
+        xTaskCreate(mesh_transmit_task, "mesh_transmit", 4 * 1024, NULL,
+                    CONFIG_MDF_TASK_DEFAULT_PRIOTY, NULL);
+    if (ret_transmit != pdPASS) {
+      ESP_LOGE(TAG, "Failed to create mesh transmit task");
+    }
+  } else {
+    ESP_LOGW(TAG, "Mesh transmit task not created - direct transmission mode active");
   }
 }
